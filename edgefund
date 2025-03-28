@@ -1,0 +1,256 @@
+from datamodel import OrderDepth, UserId, TradingState, Order
+from typing import List
+import math
+
+class Trader:
+    def __init__(self):
+        self.resin_prices = []  # Track historical prices
+        self.kelp_prices = []   # Track historical prices
+        
+        self.LIMIT = {
+            "RAINFOREST_RESIN": 50,
+            "KELP": 50
+        }
+    
+    # Takes favorable orders from the market
+    def take_best_orders(self, product: str, fair_value: int, take_width: float, orders: List[Order], 
+                         order_depth: OrderDepth, position: int, buy_order_volume: int, sell_order_volume: int,
+                         prevent_adverse: bool = False, adverse_volume: int = 0) -> (int, int):
+        position_limit = self.LIMIT[product]
+        
+        # Process sell orders (offers to sell to us)
+        if len(order_depth.sell_orders) != 0:
+            best_ask = min(order_depth.sell_orders.keys())
+            best_ask_amount = -1 * order_depth.sell_orders[best_ask]
+            
+            if prevent_adverse:
+                # Only take orders if volume is below adverse_volume threshold
+                if best_ask_amount <= adverse_volume and best_ask <= fair_value - take_width:
+                    quantity = min(best_ask_amount, position_limit - position)
+                    if quantity > 0:
+                        orders.append(Order(product, best_ask, quantity))
+                        buy_order_volume += quantity
+            else:
+                # Take orders below fair value minus width
+                if best_ask <= fair_value - take_width:
+                    quantity = min(best_ask_amount, position_limit - position)
+                    if quantity > 0:
+                        orders.append(Order(product, best_ask, quantity))
+                        buy_order_volume += quantity
+        
+        # Process buy orders (offers to buy from us)
+        if len(order_depth.buy_orders) != 0:
+            best_bid = max(order_depth.buy_orders.keys())
+            best_bid_amount = order_depth.buy_orders[best_bid]
+            
+            if prevent_adverse:
+                # Only take orders if volume is below adverse_volume threshold
+                if best_bid >= fair_value + take_width and best_bid_amount <= adverse_volume:
+                    quantity = min(best_bid_amount, position_limit + position)
+                    if quantity > 0:
+                        orders.append(Order(product, best_bid, -1 * quantity))
+                        sell_order_volume += quantity
+            else:
+                # Take orders above fair value plus width
+                if best_bid >= fair_value + take_width:
+                    quantity = min(best_bid_amount, position_limit + position)
+                    if quantity > 0:
+                        orders.append(Order(product, best_bid, -1 * quantity))
+                        sell_order_volume += quantity
+        
+        return buy_order_volume, sell_order_volume
+    
+    # Places market making orders with INTEGER prices
+    def market_make(self, product: str, orders: List[Order], bid: float, ask: float, 
+                   position: int, buy_order_volume: int, sell_order_volume: int) -> (int, int):
+        # Convert prices to integers
+        bid_price = int(bid)
+        ask_price = int(ask)
+        
+        # Calculate quantities to maintain position limits
+        buy_quantity = self.LIMIT[product] - (position + buy_order_volume)
+        if buy_quantity > 0:
+            orders.append(Order(product, bid_price, buy_quantity))
+        
+        sell_quantity = self.LIMIT[product] + (position - sell_order_volume)
+        if sell_quantity > 0:
+            orders.append(Order(product, ask_price, -sell_quantity))
+        
+        return buy_order_volume, sell_order_volume
+    
+    # Places orders to clear position with INTEGER prices
+    def clear_position_order(self, product: str, fair_value: float, width: int, orders: List[Order],
+                           order_depth: OrderDepth, position: int, buy_order_volume: int, sell_order_volume: int) -> (int, int):
+        position_after_take = position + buy_order_volume - sell_order_volume
+        
+        # Ensure we use integer prices
+        fair_for_bid = int(math.floor(fair_value))
+        fair_for_ask = int(math.ceil(fair_value))
+        
+        buy_quantity = self.LIMIT[product] - (position + buy_order_volume)
+        sell_quantity = self.LIMIT[product] + (position - sell_order_volume)
+        
+        # If position is positive, try to reduce it by selling
+        if position_after_take > 0:
+            if fair_for_ask in order_depth.buy_orders.keys():
+                clear_quantity = min(order_depth.buy_orders[fair_for_ask], position_after_take)
+                sent_quantity = min(sell_quantity, clear_quantity)
+                if sent_quantity > 0:
+                    orders.append(Order(product, fair_for_ask, -abs(sent_quantity)))
+                    sell_order_volume += abs(sent_quantity)
+        
+        # If position is negative, try to reduce it by buying
+        if position_after_take < 0:
+            if fair_for_bid in order_depth.sell_orders.keys():
+                clear_quantity = min(abs(order_depth.sell_orders[fair_for_bid]), abs(position_after_take))
+                sent_quantity = min(buy_quantity, clear_quantity)
+                if sent_quantity > 0:
+                    orders.append(Order(product, fair_for_bid, abs(sent_quantity)))
+                    buy_order_volume += abs(sent_quantity)
+        
+        return buy_order_volume, sell_order_volume
+    
+    # Calculate fair value for Resin (stable product) - returns INTEGER
+    def resin_fair_value(self, order_depth: OrderDepth) -> int:
+        # For stable products, use simple mid-price
+        if len(order_depth.sell_orders) > 0 and len(order_depth.buy_orders) > 0:
+            best_ask = min(order_depth.sell_orders.keys())
+            best_bid = max(order_depth.buy_orders.keys())
+            mid_price = (best_ask + best_bid) / 2
+            return int(mid_price)
+        return 10000  # Default if no orders
+    
+    # Calculate fair value for Kelp (volatile product) - returns INTEGER
+    def kelp_fair_value(self, order_depth: OrderDepth, timespan: int) -> int:
+        if len(order_depth.sell_orders) > 0 and len(order_depth.buy_orders) > 0:
+            # Get best prices
+            best_ask = min(order_depth.sell_orders.keys())
+            best_bid = max(order_depth.buy_orders.keys())
+            
+            # Filter for higher volume orders (more reliable)
+            filtered_ask = [price for price in order_depth.sell_orders.keys() 
+                           if abs(order_depth.sell_orders[price]) >= 15]
+            filtered_bid = [price for price in order_depth.buy_orders.keys() 
+                           if abs(order_depth.buy_orders[price]) >= 15]
+            
+            mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else best_ask
+            mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else best_bid
+            
+            # Calculate mid price from high-volume orders
+            mid_price = (mm_ask + mm_bid) / 2
+            
+            # Track historical prices
+            self.kelp_prices.append(mid_price)
+            if len(self.kelp_prices) > timespan:
+                self.kelp_prices.pop(0)
+            
+            # Use average of recent prices
+            if len(self.kelp_prices) > 0:
+                return int(sum(self.kelp_prices) / len(self.kelp_prices))
+            return int(mid_price)
+        return 10000  # Default if no orders
+    
+    # Process Rainforest Resin orders with INTEGER prices
+    def resin_orders(self, order_depth: OrderDepth, position: int) -> List[Order]:
+        orders = []
+        buy_order_volume = 0
+        sell_order_volume = 0
+        
+        # Calculate fair value
+        fair_value = self.resin_fair_value(order_depth)
+        
+        # Find strategic price levels
+        if len(order_depth.sell_orders) > 0 and len(order_depth.buy_orders) > 0:
+            # Find prices above/below fair value for strategic order placement
+            above_fair = [price for price in order_depth.sell_orders.keys() 
+                         if price > fair_value + 1]
+            below_fair = [price for price in order_depth.buy_orders.keys() 
+                         if price < fair_value - 1]
+            
+            # Get best prices just outside fair value
+            best_above_fair = min(above_fair) if len(above_fair) > 0 else fair_value + 2
+            best_below_fair = max(below_fair) if len(below_fair) > 0 else fair_value - 2
+            
+            # Take favorable orders with narrow width (0.5)
+            buy_order_volume, sell_order_volume = self.take_best_orders(
+                "RAINFOREST_RESIN", fair_value, 0.5, orders, order_depth, 
+                position, buy_order_volume, sell_order_volume)
+            
+            # Clear position if needed
+            buy_order_volume, sell_order_volume = self.clear_position_order(
+                "RAINFOREST_RESIN", fair_value, 1, orders, order_depth,
+                position, buy_order_volume, sell_order_volume)
+            
+            # Market make at strategic prices (ensure integers)
+            bid_price = int(best_below_fair + 1)
+            ask_price = int(best_above_fair - 1)
+            
+            buy_order_volume, sell_order_volume = self.market_make(
+                "RAINFOREST_RESIN", orders, bid_price, ask_price,
+                position, buy_order_volume, sell_order_volume)
+        
+        return orders
+    
+    # Process Kelp orders with INTEGER prices
+    def kelp_orders(self, order_depth: OrderDepth, timespan: int, position: int) -> List[Order]:
+        orders = []
+        buy_order_volume = 0
+        sell_order_volume = 0
+        
+        if len(order_depth.sell_orders) > 0 and len(order_depth.buy_orders) > 0:
+            # Calculate fair value with history
+            fair_value = self.kelp_fair_value(order_depth, timespan)
+            
+            # Find strategic price levels
+            above_fair = [price for price in order_depth.sell_orders.keys() 
+                         if price > fair_value + 1]
+            below_fair = [price for price in order_depth.buy_orders.keys() 
+                         if price < fair_value - 1]
+            
+            best_above_fair = min(above_fair) if len(above_fair) > 0 else fair_value + 2
+            best_below_fair = max(below_fair) if len(below_fair) > 0 else fair_value - 2
+            
+            # Take best orders (with adverse selection protection)
+            buy_order_volume, sell_order_volume = self.take_best_orders(
+                "KELP", fair_value, 1, orders, order_depth, position,
+                buy_order_volume, sell_order_volume, True, 20)
+            
+            # Clear position if needed
+            buy_order_volume, sell_order_volume = self.clear_position_order(
+                "KELP", fair_value, 2, orders, order_depth,
+                position, buy_order_volume, sell_order_volume)
+            
+            # Market make with wider width (ensure integers)
+            bid_price = int(best_below_fair + 1)
+            ask_price = int(best_above_fair - 1)
+            
+            buy_order_volume, sell_order_volume = self.market_make(
+                "KELP", orders, bid_price, ask_price,
+                position, buy_order_volume, sell_order_volume)
+        
+        return orders
+    
+    def run(self, state: TradingState):
+        result = {}
+        
+        # Configuration parameters
+        resin_take_width = 0.5
+        kelp_take_width = 1
+        kelp_timespan = 10
+        
+        # Process Rainforest Resin orders
+        if "RAINFOREST_RESIN" in state.order_depths:
+            resin_position = state.position.get("RAINFOREST_RESIN", 0)
+            resin_orders = self.resin_orders(state.order_depths["RAINFOREST_RESIN"], resin_position)
+            result["RAINFOREST_RESIN"] = resin_orders
+        
+        # Process Kelp orders
+        if "KELP" in state.order_depths:
+            kelp_position = state.position.get("KELP", 0)
+            kelp_orders = self.kelp_orders(state.order_depths["KELP"], kelp_timespan, kelp_position)
+            result["KELP"] = kelp_orders
+        
+        # Store trader data (could use jsonpickle like in the example)
+        trader_data = "HISTORY:" + str(len(self.resin_prices)) + ":" + str(len(self.kelp_prices))
+        
+        return result, 0, trader_data
